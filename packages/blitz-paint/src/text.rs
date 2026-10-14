@@ -11,8 +11,11 @@ pub(crate) fn stroke_text<'a>(
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
     doc: &BaseDocument,
     pos: Point,
+    // PATCH(rust-ui): ancestor/own CSS transforms (identity when none), so text moves with
+    // its box. Upstream drew text untransformed.
+    base: Affine,
 ) {
-    let transform = Affine::translate((pos.x * scale, pos.y * scale));
+    let transform = base * Affine::translate((pos.x * scale, pos.y * scale));
     for line in lines {
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {

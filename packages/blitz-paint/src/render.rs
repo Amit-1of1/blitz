@@ -18,7 +18,6 @@ use blitz_dom::node::{
 use blitz_dom::{BaseDocument, ElementData, Node, local_name};
 use blitz_traits::devtools::DevtoolSettings;
 
-use euclid::Transform3D;
 use style::values::computed::BorderCornerRadius;
 use style::{
     dom::TElement,
@@ -116,6 +115,7 @@ impl BlitzDomPainter<'_> {
                 x: -viewport_scroll.x,
                 y: -viewport_scroll.y,
             },
+            Affine::IDENTITY,
         );
 
         // Render debug overlay
@@ -135,7 +135,15 @@ impl BlitzDomPainter<'_> {
     ///
     /// Approaching rendering this way guarantees we have all the styles we need when rendering text with not having
     /// to traverse back to the parent for its styles, or needing to pass down styles
-    fn render_element(&self, scene: &mut impl PaintScene, node_id: usize, location: Point) {
+    /// PATCH(rust-ui): `ancestor` is the combined CSS transform of the ancestors (in device
+    /// space, applied to absolutely positioned drawing). Upstream had no nested transforms.
+    fn render_element(
+        &self,
+        scene: &mut impl PaintScene,
+        node_id: usize,
+        location: Point,
+        ancestor: Affine,
+    ) {
         let node = &self.dom.as_ref().tree()[node_id];
 
         // Early return if the element is hidden
@@ -204,9 +212,15 @@ impl BlitzDomPainter<'_> {
         };
 
         // Don't render things that are out of view
+        // PATCH(rust-ui): only when untransformed (a transform can move a box into view), and
+        // not when the box has z-indexed descendants (they may sit anywhere).
         let scaled_y = box_position.y * self.scale;
         let scaled_content_height = content_size.height.max(size.height) as f64 * self.scale;
-        if scaled_y > self.height as f64 || scaled_y + scaled_content_height < 0.0 {
+        let transformed = ancestor != Affine::IDENTITY || node.css_transform_2d().is_some();
+        if !transformed
+            && !node.is_stacking_context()
+            && (scaled_y > self.height as f64 || scaled_y + scaled_content_height < 0.0)
+        {
             return;
         }
 
@@ -216,7 +230,13 @@ impl BlitzDomPainter<'_> {
             return;
         }
 
-        let mut cx = self.element_cx(node, layout, box_position);
+        let mut cx = self.element_cx(node, layout, box_position, ancestor);
+        // PATCH(rust-ui): z-indexed descendants, painted in z order with this stacking context.
+        let stacked = if node.is_stacking_context() {
+            node.stacked_descendants()
+        } else {
+            Vec::new()
+        };
         cx.draw_outline(scene);
         cx.draw_outset_box_shadow(scene);
         cx.draw_background(scene);
@@ -252,16 +272,24 @@ impl BlitzDomPainter<'_> {
             cx.draw_text_input_text(scene, content_position);
             cx.draw_inline_layout(scene, content_position);
             cx.draw_marker(scene, content_position);
+            cx.draw_stacked(scene, &stacked, false);
             cx.draw_children(scene);
+            cx.draw_stacked(scene, &stacked, true);
         });
     }
 
-    fn render_node(&self, scene: &mut impl PaintScene, node_id: usize, location: Point) {
+    fn render_node(
+        &self,
+        scene: &mut impl PaintScene,
+        node_id: usize,
+        location: Point,
+        ancestor: Affine,
+    ) {
         let node = &self.dom.as_ref().tree()[node_id];
 
         match &node.data {
             NodeData::Element(_) | NodeData::AnonymousBlock(_) => {
-                self.render_element(scene, node_id, location)
+                self.render_element(scene, node_id, location, ancestor)
             }
             NodeData::Text(TextNodeData { .. }) => {
                 // Text nodes should never be rendered directly
@@ -279,6 +307,7 @@ impl BlitzDomPainter<'_> {
         node: &'w Node,
         layout: Layout,
         box_position: Point,
+        ancestor: Affine,
     ) -> ElementCx<'w> {
         let style = node
             .stylo_element_data
@@ -298,43 +327,17 @@ impl BlitzDomPainter<'_> {
 
         // the bezpaths for every element are (potentially) cached (not yet, tbd)
         // By performing the transform, we prevent the cache from becoming invalid when the page shifts around
-        let mut transform = Affine::translate(box_position.to_vec2() * scale);
+        let position = Affine::translate(box_position.to_vec2() * scale);
+        let mut transform = ancestor * position;
 
-        // Apply CSS transform property (where transforms are 2d)
-        //
-        // TODO: Handle hit testing correctly for transformed nodes
-        // TODO: Implement nested transforms
-        let (t, has_3d) = &style
-            .get_box()
-            .transform
-            .to_transform_3d_matrix(None)
-            .unwrap_or((Transform3D::default(), false));
-        if !has_3d {
-            // See: https://drafts.csswg.org/css-transforms-2/#two-dimensional-subset
-            // And https://docs.rs/kurbo/latest/kurbo/struct.Affine.html#method.new
-            let kurbo_transform =
-                Affine::new([t.m11, t.m12, t.m21, t.m22, t.m41, t.m42].map(|v| v as f64));
-
-            // Apply the transform origin by:
-            //   - Translating by the origin offset
-            //   - Applying our transform
-            //   - Translating by the inverse of the origin offset
-            let transform_origin = &style.get_box().transform_origin;
-            let origin_translation = Affine::translate(Vec2 {
-                x: transform_origin
-                    .horizontal
-                    .resolve(CSSPixelLength::new(frame.border_box.width() as f32))
-                    .px() as f64,
-                y: transform_origin
-                    .vertical
-                    .resolve(CSSPixelLength::new(frame.border_box.width() as f32))
-                    .px() as f64,
-            });
-            let kurbo_transform =
-                origin_translation * kurbo_transform * origin_translation.inverse();
-
-            transform *= kurbo_transform;
+        // PATCH(rust-ui): apply the CSS transform with percentages resolved against the border
+        // box and `transform-origin` resolved per axis (upstream dropped any transform with a
+        // percentage and resolved the vertical origin against the width). Also hand the
+        // combined transform down to descendants and to text (`base`).
+        if let Some([a, b, c, d, e, f]) = node.css_transform_2d() {
+            transform *= Affine::new([a, b, c, d, e * scale, f * scale]);
         }
+        let base = transform * position.inverse();
 
         let element = node.element_data().unwrap();
 
@@ -347,6 +350,7 @@ impl BlitzDomPainter<'_> {
             node,
             element,
             transform,
+            base,
             #[cfg(feature = "svg")]
             svg: element.svg_data(),
             text_input: element.text_input_data(),
@@ -393,6 +397,8 @@ struct ElementCx<'a> {
     node: &'a Node,
     element: &'a ElementData,
     transform: Affine,
+    /// PATCH(rust-ui): transform for things drawn at absolute positions (text, children)
+    base: Affine,
     #[cfg(feature = "svg")]
     svg: Option<&'a usvg::Tree>,
     text_input: Option<&'a TextInputData>,
@@ -422,6 +428,7 @@ impl ElementCx<'_> {
                 text_layout.layout.lines(),
                 self.context.dom,
                 pos,
+                self.base,
             );
         }
     }
@@ -429,7 +436,7 @@ impl ElementCx<'_> {
     fn draw_text_input_text(&self, scene: &mut impl PaintScene, pos: Point) {
         // Render the text in text inputs
         if let Some(input_data) = self.text_input {
-            let transform = Affine::translate((pos.x * self.scale, pos.y * self.scale));
+            let transform = self.base * Affine::translate((pos.x * self.scale, pos.y * self.scale));
 
             if self.node.is_focussed() {
                 // Render selection/caret
@@ -460,6 +467,7 @@ impl ElementCx<'_> {
                 input_data.editor.try_layout().unwrap().lines(),
                 self.context.dom,
                 pos,
+                self.base,
             );
         }
     }
@@ -496,15 +504,47 @@ impl ElementCx<'_> {
                 y: pos.y + y_offset as f64,
             };
 
-            crate::text::stroke_text(self.scale, scene, layout.lines(), self.context.dom, pos);
+            crate::text::stroke_text(
+                self.scale,
+                scene,
+                layout.lines(),
+                self.context.dom,
+                pos,
+                self.base,
+            );
         }
     }
 
     fn draw_children(&self, scene: &mut impl PaintScene) {
         if let Some(children) = &*self.node.paint_children.borrow() {
             for child_id in children {
-                self.render_node(scene, *child_id, self.pos);
+                // PATCH(rust-ui): z-indexed children are painted by their stacking context.
+                if self.node.with(*child_id).is_z_hoisted() {
+                    continue;
+                }
+                self.context
+                    .render_node(scene, *child_id, self.pos, self.base);
             }
+        }
+    }
+
+    /// PATCH(rust-ui): paint this stacking context's z-indexed descendants: negative z-index
+    /// before the in-flow content (`above == false`), zero and positive after it.
+    fn draw_stacked(&self, scene: &mut impl PaintScene, stacked: &[(i32, usize)], above: bool) {
+        for &(z, id) in stacked {
+            if (z >= 0) != above {
+                continue;
+            }
+            let node = self.node.with(id);
+            let Some(parent) = node.layout_parent.get() else {
+                continue;
+            };
+            let offset = self.node.with(parent).content_offset_from(self.node.id);
+            let location = Point {
+                x: self.pos.x + offset.x as f64,
+                y: self.pos.y + offset.y as f64,
+            };
+            self.context.render_node(scene, id, location, self.base);
         }
     }
 
@@ -550,8 +590,8 @@ impl ElementCx<'_> {
         let x_scale = paint_size.width as f64 / object_size.width as f64;
         let y_scale = paint_size.height as f64 / object_size.height as f64;
 
-        let transform =
-            Affine::translate((self.pos.x * self.scale + x, self.pos.y * self.scale + y))
+        let transform = self.base
+            * Affine::translate((self.pos.x * self.scale + x, self.pos.y * self.scale + y))
                 .pre_scale_non_uniform(x_scale, y_scale);
 
         anyrender_svg::render_svg_tree(scene, svg, transform);

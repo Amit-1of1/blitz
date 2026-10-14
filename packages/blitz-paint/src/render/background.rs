@@ -146,11 +146,12 @@ impl ElementCx<'_> {
             frame_h - bg_size.height as f32,
         );
 
-        let transform = kurbo::Affine::translate((
-            (self.pos.x * self.scale) + bg_pos.x,
-            (self.pos.y * self.scale) + bg_pos.y,
-        ))
-        .pre_scale_non_uniform(x_ratio, y_ratio);
+        let transform = self.base
+            * kurbo::Affine::translate((
+                (self.pos.x * self.scale) + bg_pos.x,
+                (self.pos.y * self.scale) + bg_pos.y,
+            ))
+            .pre_scale_non_uniform(x_ratio, y_ratio);
 
         anyrender_svg::render_svg_tree(scene, svg, transform);
     }
