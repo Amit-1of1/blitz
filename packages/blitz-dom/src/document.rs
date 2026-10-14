@@ -134,6 +134,9 @@ pub struct BaseDocument {
     pub(crate) hover_node_id: Option<usize>,
     /// The node which is currently focussed (if any)
     pub(crate) focus_node_id: Option<usize>,
+    /// PATCH(rust-ui): the time passed to the last `resolve`, so layout can be brought up to
+    /// date between frames (`resolve_now`) without moving CSS animations.
+    pub(crate) last_animation_time: f64,
     /// The node which is currently active (if any)
     pub(crate) active_node_id: Option<usize>,
     /// The node which recieved a mousedown event (if any)
@@ -272,6 +275,7 @@ impl BaseDocument {
 
             hover_node_id: None,
             focus_node_id: None,
+            last_animation_time: 0.0,
             active_node_id: None,
             mousedown_node_id: None,
             has_active_animations: false,
@@ -357,6 +361,11 @@ impl BaseDocument {
 
     pub fn get_node_mut(&mut self, node_id: usize) -> Option<&mut Node> {
         self.nodes.get_mut(node_id)
+    }
+
+    /// PATCH(rust-ui): the focused element, without falling back to the root.
+    pub fn focus_node_id(&self) -> Option<usize> {
+        self.focus_node_id
     }
 
     pub fn get_focussed_node_id(&self) -> Option<usize> {
@@ -823,6 +832,7 @@ impl BaseDocument {
 
     /// Restyle the tree and then relayout it
     pub fn resolve(&mut self, current_time_for_animations: f64) {
+        self.last_animation_time = current_time_for_animations;
         if TDocument::as_node(&&self.nodes[0])
             .first_element_child()
             .is_none()
@@ -884,11 +894,79 @@ impl BaseDocument {
         self.root_element().hit(x, y)
     }
 
+    /// PATCH(rust-ui): bring style and layout up to date at the last animation time.
+    pub fn resolve_now(&mut self) {
+        self.resolve(self.last_animation_time);
+    }
+
     pub fn focus_next_node(&mut self) -> Option<usize> {
-        let focussed_node_id = self.get_focussed_node_id()?;
-        let id = self.next_node(&self.nodes[focussed_node_id], |node| node.is_focussable())?;
+        self.focus_step(false)
+    }
+
+    // PATCH(rust-ui): Tab order over rendered, focusable elements, in both directions, wrapping
+    // at the ends (upstream only walked forwards and stopped when nothing was focused).
+    pub fn focus_prev_node(&mut self) -> Option<usize> {
+        self.focus_step(true)
+    }
+
+    fn focus_step(&mut self, backwards: bool) -> Option<usize> {
+        let mut order = Vec::new();
+        self.visit(|id, node| {
+            if node.is_focussable() && self.is_rendered(id) {
+                order.push(id);
+            }
+        });
+        if order.is_empty() {
+            return None;
+        }
+        let current = self
+            .focus_node_id
+            .and_then(|id| order.iter().position(|&o| o == id));
+        let next = match (current, backwards) {
+            (None, false) => 0,
+            (None, true) => order.len() - 1,
+            (Some(i), false) => (i + 1) % order.len(),
+            (Some(i), true) => (i + order.len() - 1) % order.len(),
+        };
+        let id = order[next];
         self.set_focus_to(id);
         Some(id)
+    }
+
+    /// Whether the node and all its ancestors generate a box (no `display: none`) and are visible.
+    pub fn is_rendered(&self, node_id: usize) -> bool {
+        let mut id = Some(node_id);
+        while let Some(i) = id {
+            let node = &self.nodes[i];
+            if node.is_element() && node.style.display == taffy::Display::None {
+                return false;
+            }
+            id = node.parent;
+        }
+        let node = &self.nodes[node_id];
+        let visible = node.primary_styles().is_none_or(|s| {
+            s.get_inherited_box().visibility == style::computed_values::visibility::T::Visible
+        });
+        visible && (node.final_layout.size.width > 0.0 || node.final_layout.size.height > 0.0)
+    }
+
+    /// PATCH(rust-ui): the nearest element at or above `node_id` that can take focus from a
+    /// click (`tabindex="-1"` counts, unlike for Tab).
+    pub fn focus_target_for_click(&self, node_id: usize) -> Option<usize> {
+        let mut id = Some(node_id);
+        while let Some(i) = id {
+            let node = &self.nodes[i];
+            if let Some(el) = node.element_data() {
+                if el.attr(local_name!("disabled")).is_some() {
+                    return None;
+                }
+                if el.is_focussable || el.attr(local_name!("tabindex")).is_some() {
+                    return Some(i);
+                }
+            }
+            id = node.parent;
+        }
+        None
     }
 
     /// Clear the focussed node
@@ -1207,6 +1285,8 @@ impl BaseDocument {
         // println!("\n\nRESOLVE LAYOUT\n===========\n");
 
         taffy::compute_root_layout(self, root_element_id, available_space);
+        // PATCH(rust-ui): place `position: fixed` boxes against the viewport.
+        self.layout_fixed_position_boxes();
         taffy::round_layout(self, root_element_id);
 
         // println!("\n\n");

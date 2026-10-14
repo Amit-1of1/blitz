@@ -22,9 +22,40 @@ pub(crate) fn handle_keypress<F: FnMut(DomEvent)>(
     event: BlitzKeyEvent,
     mut dispatch_event: F,
 ) {
+    // PATCH(rust-ui): Shift+Tab moves backwards, Tab with nothing focused starts at the first
+    // focusable element, and Enter/Space activate buttons and links like a click.
     if event.key == Key::Tab {
-        doc.focus_next_node();
+        if event.modifiers.contains(Modifiers::SHIFT) {
+            doc.focus_prev_node();
+        } else {
+            doc.focus_next_node();
+        }
         return;
+    }
+
+    if event.state.is_pressed() && doc.focus_node_id == Some(target) {
+        let activates = doc.nodes[target].element_data().is_some_and(|el| {
+            let is_button = el.name.local == local_name!("button")
+                || el.attr(local_name!("role")) == Some("button")
+                || (el.name.local == local_name!("input")
+                    && matches!(
+                        el.attr(local_name!("type")),
+                        Some("button" | "submit" | "reset" | "checkbox" | "radio")
+                    ));
+            let is_link =
+                el.name.local == local_name!("a") && el.attr(local_name!("href")).is_some();
+            match &event.key {
+                Key::Enter => is_button || is_link,
+                Key::Character(c) if c == " " => is_button,
+                _ => false,
+            }
+        });
+        if activates {
+            let mods = event.modifiers;
+            let data = doc.nodes[target].synthetic_click_event_data(mods);
+            dispatch_event(DomEvent::new(target, DomEventData::Click(data)));
+            return;
+        }
     }
 
     if let Some(node_id) = doc.focus_node_id {

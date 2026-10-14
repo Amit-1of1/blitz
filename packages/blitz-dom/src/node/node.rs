@@ -705,71 +705,270 @@ impl Node {
             .unwrap_or(0)
     }
 
-    /// Takes an (x, y) position (relative to the *parent's* top-left corner) and returns:
-    ///    - None if the position is outside of this node's bounds
-    ///    - Some(HitResult) if the position is within the node but doesn't match any children
-    ///    - The result of recursively calling child.hit() on the the child element that is
-    ///      positioned at that position if there is one.
-    ///
-    /// TODO: z-index
-    /// (If multiple children are positioned at the position then a random one will be recursed into)
-    pub fn hit(&self, x: f32, y: f32) -> Option<HitResult> {
-        let mut x = x - self.final_layout.location.x + self.scroll_offset.x as f32;
-        let mut y = y - self.final_layout.location.y + self.scroll_offset.y as f32;
+    /// PATCH(rust-ui): a positioned element with an integer `z-index`. It is painted (and hit
+    /// tested) in z order with its nearest stacking-context ancestor rather than inside its
+    /// parent, so it can cover later siblings of its ancestors. Upstream only ordered siblings.
+    pub fn is_z_hoisted(&self) -> bool {
+        self.layout_parent.get().is_some()
+            && self.primary_styles().is_some_and(|s| {
+                s.clone_position() != Position::Static && !s.clone_z_index().is_auto()
+            })
+    }
 
-        let size = self.final_layout.size;
-        let matches_self = !(x < 0.0
-            || x > size.width + self.scroll_offset.x as f32
-            || y < 0.0
-            || y > size.height + self.scroll_offset.y as f32);
-
-        let content_size = self.final_layout.content_size;
-        let matches_content = !(x < 0.0
-            || x > content_size.width + self.scroll_offset.x as f32
-            || y < 0.0
-            || y > content_size.height + self.scroll_offset.y as f32);
-
-        if !matches_self && !matches_content {
-            return None;
+    /// PATCH(rust-ui): whether descendants with a z-index are ordered inside this element
+    /// (the root, a z-indexed or fixed box, `opacity < 1`, or a `transform`).
+    pub fn is_stacking_context(&self) -> bool {
+        // The root element (its layout parent is the document node, if any).
+        if self
+            .layout_parent
+            .get()
+            .is_none_or(|p| !self.with(p).is_element())
+        {
+            return true;
         }
+        self.primary_styles().is_some_and(|s| {
+            let position = s.clone_position();
+            (position != Position::Static && !s.clone_z_index().is_auto())
+                || position == Position::Fixed
+                || s.get_effects().opacity < 1.0
+                || !s.get_box().transform.0.is_empty()
+        })
+    }
 
-        if self.flags.is_inline_root() {
-            let content_box_offset = taffy::Point {
-                x: self.final_layout.padding.left + self.final_layout.border.left,
-                y: self.final_layout.padding.top + self.final_layout.border.top,
-            };
-            x -= content_box_offset.x;
-            y -= content_box_offset.y;
-        }
-
-        // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
-        self.paint_children
+    /// PATCH(rust-ui): this stacking context's z-indexed descendants (not those of nested
+    /// contexts), sorted by z-index (stable, so ties stay in tree order).
+    pub fn stacked_descendants(&self) -> Vec<(i32, usize)> {
+        let mut out = Vec::new();
+        let mut stack: Vec<usize> = self
+            .paint_children
             .borrow()
             .iter()
             .flatten()
             .rev()
-            .find_map(|&i| self.with(i).hit(x, y))
-            .or_else(|| {
-                if self.flags.is_inline_root() {
-                    let element_data = &self.element_data().unwrap();
-                    let layout = &element_data.inline_layout_data.as_ref().unwrap().layout;
-                    let scale = layout.scale();
+            .copied()
+            .collect();
+        while let Some(id) = stack.pop() {
+            let node = self.with(id);
+            if node.is_element() && node.style.display == taffy::Display::None {
+                continue;
+            }
+            if node.is_z_hoisted() {
+                out.push((node.z_index(), id));
+                continue;
+            }
+            if node.is_stacking_context() {
+                continue;
+            }
+            if let Some(children) = &*node.paint_children.borrow() {
+                stack.extend(children.iter().rev());
+            }
+        }
+        out.sort_by_key(|&(z, _)| z);
+        out
+    }
 
-                    Cluster::from_point(layout, x * scale, y * scale).and_then(|(cluster, _)| {
+    /// PATCH(rust-ui): where `self`'s content coordinates start (its border box shifted by its
+    /// own scroll offset), in the content coordinates of the layout ancestor `ancestor` (the
+    /// space `ancestor`'s children are positioned in).
+    pub fn content_offset_from(&self, ancestor: usize) -> taffy::Point<f32> {
+        let mut x = -(self.scroll_offset.x as f32);
+        let mut y = -(self.scroll_offset.y as f32);
+        let mut node = self;
+        while node.id != ancestor {
+            x += node.final_layout.location.x;
+            y += node.final_layout.location.y;
+            let Some(parent) = node.layout_parent.get() else {
+                break;
+            };
+            node = node.with(parent);
+            if node.id != ancestor {
+                x -= node.scroll_offset.x as f32;
+                y -= node.scroll_offset.y as f32;
+            }
+        }
+        taffy::Point { x, y }
+    }
+
+    /// PATCH(rust-ui): the element's 2D CSS `transform` as an affine matrix
+    /// `[a, b, c, d, e, f]` (x' = a*x + c*y + e, y' = b*x + d*y + f) in its own border-box
+    /// coordinates, with `transform-origin` applied and percentages resolved against the
+    /// border box. `None` for no transform, a 3D transform or a non-invertible one.
+    pub fn css_transform_2d(&self) -> Option<[f64; 6]> {
+        use style::values::computed::CSSPixelLength;
+        let styles = self.primary_styles()?;
+        let box_style = styles.get_box();
+        if box_style.transform.0.is_empty() {
+            return None;
+        }
+        let size = self.final_layout.size;
+        let reference = euclid::default::Rect::new(
+            euclid::default::Point2D::origin(),
+            euclid::default::Size2D::new(
+                CSSPixelLength::new(size.width),
+                CSSPixelLength::new(size.height),
+            ),
+        );
+        let (t, has_3d) = box_style
+            .transform
+            .to_transform_3d_matrix(Some(&reference))
+            .ok()?;
+        if has_3d {
+            return None;
+        }
+        let [a, b, c, d, e, f] = [t.m11, t.m12, t.m21, t.m22, t.m41, t.m42].map(|v| v as f64);
+        if (a * d - b * c).abs() < 1e-9 {
+            return None;
+        }
+        let origin = &box_style.transform_origin;
+        let ox = origin
+            .horizontal
+            .resolve(CSSPixelLength::new(size.width))
+            .px() as f64;
+        let oy = origin
+            .vertical
+            .resolve(CSSPixelLength::new(size.height))
+            .px() as f64;
+        // translate(o) * M * translate(-o)
+        Some([
+            a,
+            b,
+            c,
+            d,
+            e + ox - (a * ox + c * oy),
+            f + oy - (b * ox + d * oy),
+        ])
+    }
+
+    /// Takes an (x, y) position (relative to the *parent's* top-left corner, scrolled) and
+    /// returns the deepest node painted at that point, or `None`.
+    ///
+    /// PATCH(rust-ui): rewritten. Upstream ignored transforms and `pointer-events`, only looked
+    /// at children when the point was inside the parent's box (so boxes sticking out of their
+    /// parent, like positioned popups, could not be clicked), and offset the children of a
+    /// padded inline root by the padding (so clicks beside text missed inline buttons).
+    /// Children are tried topmost first, in the same order they are painted.
+    pub fn hit(&self, x: f32, y: f32) -> Option<HitResult> {
+        if self.is_element() && self.style.display == taffy::Display::None {
+            return None;
+        }
+        let mut x = (x - self.final_layout.location.x) as f64;
+        let mut y = (y - self.final_layout.location.y) as f64;
+        if let Some([a, b, c, d, e, f]) = self.css_transform_2d() {
+            let det = a * d - b * c;
+            let (px, py) = (x - e, y - f);
+            x = (d * px - c * py) / det;
+            y = (a * py - b * px) / det;
+        }
+        let (x, y) = (x as f32, y as f32);
+
+        let size = self.final_layout.size;
+        let inside = x >= 0.0 && y >= 0.0 && x <= size.width && y <= size.height;
+
+        let styles = self.primary_styles();
+        let clips = styles.as_ref().is_some_and(|s| {
+            use style::values::computed::Overflow;
+            s.clone_overflow_x() != Overflow::Visible || s.clone_overflow_y() != Overflow::Visible
+        });
+        let takes_pointer = styles.as_ref().is_none_or(|s| {
+            use style::computed_values::pointer_events::T as PointerEvents;
+            use style::computed_values::visibility::T as Visibility;
+            s.clone_pointer_events() != PointerEvents::None
+                && s.get_inherited_box().visibility == Visibility::Visible
+        });
+        drop(styles);
+
+        // Children live in the scrolled content coordinate space.
+        let cx = x + self.scroll_offset.x as f32;
+        let cy = y + self.scroll_offset.y as f32;
+
+        // z-indexed descendants are hit in z order: positive above the content, negative below.
+        let stacked = if self.is_stacking_context() {
+            self.stacked_descendants()
+        } else {
+            Vec::new()
+        };
+        let hit_stacked = |above: bool| {
+            stacked
+                .iter()
+                .rev()
+                .filter(|&&(z, _)| (z >= 0) == above)
+                .find_map(|&(_, id)| {
+                    let node = self.with(id);
+                    let parent = node.layout_parent.get()?;
+                    let offset = self.with(parent).content_offset_from(self.id);
+                    node.hit(cx - offset.x, cy - offset.y)
+                })
+        };
+        if let Some(hit) = hit_stacked(true) {
+            return Some(hit);
+        }
+
+        if inside || !clips {
+            let child_hit = self
+                .paint_children
+                .borrow()
+                .iter()
+                .flatten()
+                .rev()
+                .filter(|&&i| !self.with(i).is_z_hoisted())
+                .find_map(|&i| self.with(i).hit(cx, cy));
+            if child_hit.is_some() {
+                return child_hit;
+            }
+
+            if inside && takes_pointer && self.flags.is_inline_root() {
+                // Text is laid out in the content box.
+                let tx = cx - self.final_layout.padding.left - self.final_layout.border.left;
+                let ty = cy - self.final_layout.padding.top - self.final_layout.border.top;
+                let element_data = &self.element_data().unwrap();
+                let layout = &element_data.inline_layout_data.as_ref().unwrap().layout;
+                let scale = layout.scale();
+                let text_hit =
+                    Cluster::from_point(layout, tx * scale, ty * scale).and_then(|(cluster, _)| {
                         let style_index = cluster.glyphs().next()?.style_index();
                         let node_id = layout.styles()[style_index].brush.id;
-                        Some(HitResult { node_id, x, y })
-                    })
-                } else {
-                    None
+                        Some(HitResult {
+                            node_id,
+                            x: tx,
+                            y: ty,
+                        })
+                    });
+                if text_hit.is_some() {
+                    return text_hit;
                 }
-            })
-            .or(Some(HitResult {
-                node_id: self.id,
-                x,
-                y,
-            })
-            .filter(|_| matches_self))
+            }
+        }
+
+        if let Some(hit) = hit_stacked(false) {
+            return Some(hit);
+        }
+
+        (inside && takes_pointer).then_some(HitResult {
+            node_id: self.id,
+            x: cx,
+            y: cy,
+        })
+    }
+
+    /// PATCH(rust-ui): whether the element scrolls its content (`overflow: auto | scroll`).
+    pub fn is_scroll_container(&self) -> bool {
+        use style::values::computed::Overflow;
+        self.primary_styles().is_some_and(|s| {
+            matches!(s.clone_overflow_x(), Overflow::Scroll | Overflow::Auto)
+                || matches!(s.clone_overflow_y(), Overflow::Scroll | Overflow::Auto)
+        })
+    }
+
+    /// PATCH(rust-ui): document-relative position of the border box. Unlike
+    /// `absolute_position`, the element's *own* scroll offset is not subtracted (scrolling moves
+    /// an element's content, not the element).
+    pub fn border_box_position(&self) -> taffy::Point<f32> {
+        let x = self.final_layout.location.x;
+        let y = self.final_layout.location.y;
+        self.layout_parent
+            .get()
+            .map(|i| self.with(i).absolute_position(x, y))
+            .unwrap_or(taffy::Point { x, y })
     }
 
     /// Computes the Document-relative coordinates of the Node

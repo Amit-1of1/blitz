@@ -61,6 +61,15 @@ pub(crate) fn handle_mousemove(
 }
 
 pub(crate) fn handle_mousedown(doc: &mut BaseDocument, target: usize, x: f32, y: f32) {
+    // PATCH(rust-ui): a click focuses the nearest focusable ancestor (or blurs when there is
+    // none), as browsers do; upstream only focused text inputs.
+    match doc.focus_target_for_click(target) {
+        Some(id) => {
+            doc.set_focus_to(id);
+        }
+        None => doc.clear_focus(),
+    }
+
     let Some(hit) = doc.hit(x, y) else {
         return;
     };
@@ -256,6 +265,6 @@ pub(crate) fn handle_click<F: FnMut(DomEvent)>(
         maybe_node_id = doc.nodes[node_id].parent;
     }
 
-    // If nothing is matched then clear focus
-    doc.clear_focus();
+    // PATCH(rust-ui): focus is now set (or cleared) on mousedown, like browsers do; upstream
+    // cleared it here, after click handlers had run, which blurred focused buttons.
 }
