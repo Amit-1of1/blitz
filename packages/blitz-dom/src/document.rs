@@ -137,6 +137,9 @@ pub struct BaseDocument {
     /// PATCH(rust-ui): the time passed to the last `resolve`, so layout can be brought up to
     /// date between frames (`resolve_now`) without moving CSS animations.
     pub(crate) last_animation_time: f64,
+    /// PATCH(rust-ui): `<img>` nodes whose image arrived since the last
+    /// [`BaseDocument::take_loaded_images`], so the embedder can fire `load` events.
+    loaded_images: Vec<usize>,
     /// The node which is currently active (if any)
     pub(crate) active_node_id: Option<usize>,
     /// The node which recieved a mousedown event (if any)
@@ -276,6 +279,7 @@ impl BaseDocument {
             hover_node_id: None,
             focus_node_id: None,
             last_animation_time: 0.0,
+            loaded_images: Vec::new(),
             active_node_id: None,
             mousedown_node_id: None,
             has_active_animations: false,
@@ -670,6 +674,11 @@ impl BaseDocument {
         }
     }
 
+    /// PATCH(rust-ui): `<img>` nodes whose image loaded since the last call, oldest first.
+    pub fn take_loaded_images(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.loaded_images)
+    }
+
     pub fn load_resource(&mut self, resource: Resource) {
         match resource {
             Resource::Css(node_id, css) => {
@@ -688,6 +697,8 @@ impl BaseDocument {
                         // Clear layout cache
                         node.cache.clear();
                         node.insert_damage(ALL_DAMAGE);
+                        // PATCH(rust-ui): report the load.
+                        self.loaded_images.push(node_id);
                     }
                     ImageType::Background(idx) => {
                         if let Some(Some(bg_image)) = node
@@ -713,6 +724,8 @@ impl BaseDocument {
                         // Clear layout cache
                         node.cache.clear();
                         node.insert_damage(ALL_DAMAGE);
+                        // PATCH(rust-ui): report the load.
+                        self.loaded_images.push(node_id);
                     }
                     ImageType::Background(idx) => {
                         if let Some(Some(bg_image)) = node
