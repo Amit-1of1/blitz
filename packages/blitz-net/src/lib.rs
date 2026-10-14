@@ -81,9 +81,17 @@ impl<D: 'static> Provider<D> {
         handler: BoxedHandler<D>,
         res_callback: SharedCallback<D>,
     ) -> Result<(), ProviderError> {
-        let (_response_url, bytes) = Self::fetch_inner(client, request).await?;
-        handler.bytes(doc_id, bytes, res_callback);
-        Ok(())
+        // PATCH(rust-ui): tell the handler when the fetch fails, so an `<img>` can fire `error`.
+        match Self::fetch_inner(client, request).await {
+            Ok((_response_url, bytes)) => {
+                handler.bytes(doc_id, bytes, res_callback);
+                Ok(())
+            }
+            Err(e) => {
+                handler.failed(doc_id, res_callback);
+                Err(e)
+            }
+        }
     }
 
     #[allow(clippy::type_complexity)]
