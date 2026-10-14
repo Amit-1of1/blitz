@@ -421,6 +421,30 @@ impl DocumentMutator<'_> {
         child_ids: &[usize],
         insert_children_fn: &dyn Fn(&mut Node, &[usize]),
     ) {
+        // PATCH(rust-ui): detach moved children from their old parent *before* inserting them.
+        // Upstream removed them afterwards with `retain`, which for a move within the same
+        // parent (a keyed list reorder) also removed the copy just inserted, losing the node.
+        let mut was_in_doc = Vec::with_capacity(child_ids.len());
+        for child_id in child_ids.iter().copied() {
+            let child = &self.doc.nodes[child_id];
+            let child_was_in_doc = child.flags.is_in_document();
+            was_in_doc.push(child_was_in_doc);
+            if let Some(old_parent_id) = child.parent {
+                let old_parent = &mut self.doc.nodes[old_parent_id];
+                old_parent.insert_damage(ALL_DAMAGE);
+
+                // TODO: make this fine grained / conditional based on ElementSelectorFlags
+                if child_was_in_doc {
+                    if let Some(data) = &mut *old_parent.stylo_element_data.borrow_mut() {
+                        data.hint |= RestyleHint::restyle_subtree();
+                    }
+                }
+
+                old_parent.children.retain(|id| *id != child_id);
+                self.maybe_record_node(old_parent_id);
+            }
+        }
+
         let new_parent = &mut self.doc.nodes[parent_id];
         new_parent.insert_damage(ALL_DAMAGE);
         let new_parent_is_in_doc = new_parent.flags.is_in_document();
@@ -434,28 +458,10 @@ impl DocumentMutator<'_> {
 
         insert_children_fn(new_parent, child_ids);
 
-        for child_id in child_ids.iter().copied() {
-            let child = &mut self.doc.nodes[child_id];
-            let old_parent_id = child.parent.replace(parent_id);
-
-            let child_was_in_doc = child.flags.is_in_document();
+        for (child_id, child_was_in_doc) in child_ids.iter().copied().zip(was_in_doc) {
+            self.doc.nodes[child_id].parent = Some(parent_id);
             if new_parent_is_in_doc != child_was_in_doc {
                 self.process_added_subtree(child_id);
-            }
-
-            if let Some(old_parent_id) = old_parent_id {
-                let old_parent = &mut self.doc.nodes[old_parent_id];
-                old_parent.insert_damage(ALL_DAMAGE);
-
-                // TODO: make this fine grained / conditional based on ElementSelectorFlags
-                if child_was_in_doc {
-                    if let Some(data) = &mut *old_parent.stylo_element_data.borrow_mut() {
-                        data.hint |= RestyleHint::restyle_subtree();
-                    }
-                }
-
-                old_parent.children.retain(|id| *id != child_id);
-                self.maybe_record_node(old_parent_id);
             }
         }
 
