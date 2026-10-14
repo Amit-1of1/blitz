@@ -24,6 +24,13 @@ pub trait NetProvider<Data>: Send + Sync + 'static {
 /// the NetCallack with the result.
 pub trait NetHandler<Data>: Send + Sync + 'static {
     fn bytes(self: Box<Self>, doc_id: usize, bytes: Bytes, callback: SharedCallback<Data>);
+
+    /// PATCH(rust-ui): the request failed before any bytes arrived (missing file, network
+    /// error). Lets a handler report the failure for its node, for example an `<img>`'s
+    /// `error` event. Does nothing by default.
+    fn failed(self: Box<Self>, doc_id: usize, callback: SharedCallback<Data>) {
+        let _ = (doc_id, callback);
+    }
 }
 
 /// A type which accepts the parsed result of a network request and sends it back to the Document
