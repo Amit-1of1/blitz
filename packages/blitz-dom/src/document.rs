@@ -140,6 +140,9 @@ pub struct BaseDocument {
     /// PATCH(rust-ui): `<img>` nodes whose image arrived since the last
     /// [`BaseDocument::take_loaded_images`], so the embedder can fire `load` events.
     loaded_images: Vec<usize>,
+    /// PATCH(rust-ui): `<img>` nodes whose image failed to load or decode since the last
+    /// [`BaseDocument::take_failed_images`], so the embedder can fire `error` events.
+    failed_images: Vec<usize>,
     /// The node which is currently active (if any)
     pub(crate) active_node_id: Option<usize>,
     /// The node which recieved a mousedown event (if any)
@@ -280,6 +283,7 @@ impl BaseDocument {
             focus_node_id: None,
             last_animation_time: 0.0,
             loaded_images: Vec::new(),
+            failed_images: Vec::new(),
             active_node_id: None,
             mousedown_node_id: None,
             has_active_animations: false,
@@ -679,6 +683,11 @@ impl BaseDocument {
         std::mem::take(&mut self.loaded_images)
     }
 
+    /// PATCH(rust-ui): `<img>` nodes whose image failed since the last call, oldest first.
+    pub fn take_failed_images(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.failed_images)
+    }
+
     pub fn load_resource(&mut self, resource: Resource) {
         match resource {
             Resource::Css(node_id, css) => {
@@ -770,6 +779,12 @@ impl BaseDocument {
 
                 // TODO: see if we can only invalidate if resolved fonts may have changed
                 self.invalidate_inline_contexts();
+            }
+            // PATCH(rust-ui): report the failure (background images just stay unpainted).
+            Resource::ImageFailed(node_id, ImageType::Image) => {
+                if self.get_node(node_id).is_some() {
+                    self.failed_images.push(node_id);
+                }
             }
             Resource::None => {
                 // Do nothing

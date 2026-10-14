@@ -28,6 +28,8 @@ pub enum Resource {
     #[cfg(feature = "svg")]
     Svg(usize, ImageType, Box<usvg::Tree>),
     Css(usize, DocumentStyleSheet),
+    /// PATCH(rust-ui): the image for this node could not be fetched or decoded.
+    ImageFailed(usize, ImageType),
     Font(Bytes),
     Navigation {
         url: String,
@@ -342,6 +344,11 @@ impl NetHandler<Resource> for ImageHandler {
             }
         }
 
-        callback.call(doc_id, Err(Some(String::from("Could not parse image"))))
+        // PATCH(rust-ui): report which node failed, so it can fire `error`.
+        callback.call(doc_id, Ok(Resource::ImageFailed(self.0, self.1)))
+    }
+
+    fn failed(self: Box<Self>, doc_id: usize, callback: SharedCallback<Resource>) {
+        callback.call(doc_id, Ok(Resource::ImageFailed(self.0, self.1)))
     }
 }
