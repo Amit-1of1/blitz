@@ -220,7 +220,11 @@ pub(crate) fn collect_layout_children(
             }
 
             // TODO: fix display:contents
-            if all_inline {
+            // PATCH(rust-ui): `display: contents` children are skipped by the loop above, so a
+            // container whose children are all contents wrappers counted as "all inline" and
+            // became an inline root: everything inside was laid out at max-content width.
+            // Contents children take the general path below instead.
+            if all_inline && !has_contents {
                 let existing_layout = doc.nodes[container_node_id]
                     .element_data_mut()
                     .and_then(|el| el.inline_layout_data.take());
@@ -404,6 +408,20 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: usize) {
 }
 
 /// Handles the cases where there are text nodes or inline nodes that need to be wrapped in an anonymous block node
+fn block_is_only_whitespace(doc: &BaseDocument, node_id: usize) -> bool {
+    for child_id in doc.nodes[node_id].children.iter().copied() {
+        let child = &doc.nodes[child_id];
+        if child
+            .text_data()
+            .is_none_or(|text_data| !text_data.content.chars().all(|c| c.is_ascii_whitespace()))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn collect_complex_layout_children(
     doc: &mut BaseDocument,
     container_node_id: usize,
@@ -412,21 +430,41 @@ fn collect_complex_layout_children(
     hide_whitespace: bool,
     needs_wrap: impl Fn(NodeKind, DisplayOutside) -> bool,
 ) {
-    fn block_is_only_whitespace(doc: &BaseDocument, node_id: usize) -> bool {
-        for child_id in doc.nodes[node_id].children.iter().copied() {
-            let child = &doc.nodes[child_id];
-            if child
-                .text_data()
-                .is_none_or(|text_data| !text_data.content.chars().all(|c| c.is_ascii_whitespace()))
-            {
-                return false;
-            }
+    // PATCH(rust-ui): the walk moved into `collect_complex_layout_children_of` so it can
+    // recurse into `display: contents` children (see there).
+    collect_complex_layout_children_of(
+        doc,
+        container_node_id,
+        container_node_id,
+        layout_children,
+        anonymous_block_id,
+        hide_whitespace,
+        &needs_wrap,
+    );
+
+    // If anonymous block node only contains whitespace then delete it
+    if let Some(anon_id) = *anonymous_block_id {
+        if block_is_only_whitespace(doc, anon_id) {
+            layout_children.pop();
+            doc.nodes.remove(anon_id);
+            *anonymous_block_id = None;
         }
-
-        true
     }
+}
 
-    doc.iter_children_and_pseudos_mut(container_node_id, |child_id, doc| {
+/// Collect the children of `source_node_id` as layout children of `container_node_id`. The
+/// two are the same node except inside a `display: contents` child, whose own children are
+/// laid out as if they were the container's.
+fn collect_complex_layout_children_of(
+    doc: &mut BaseDocument,
+    container_node_id: usize,
+    source_node_id: usize,
+    layout_children: &mut Vec<usize>,
+    anonymous_block_id: &mut Option<usize>,
+    hide_whitespace: bool,
+    needs_wrap: &dyn Fn(NodeKind, DisplayOutside) -> bool,
+) {
+    doc.iter_children_and_pseudos_mut(source_node_id, |child_id, doc| {
         // Get node kind (text, element, comment, etc)
         let child_node_kind = doc.nodes[child_id].data.kind();
 
@@ -455,8 +493,20 @@ fn collect_complex_layout_children(
             // return;
         }
         // Recurse into `Display::Contents` nodes
+        // PATCH(rust-ui): the contents node's own children are this container's layout
+        // children (pushed, wrapped or recursed into like direct children). Upstream 0.2.4
+        // called `collect_layout_children` on it, which hoisted its *grandchildren*: an
+        // element directly inside a `display: contents` wrapper lost its box.
         else if display_inside == DisplayInside::Contents {
-            collect_layout_children(doc, child_id, layout_children, anonymous_block_id)
+            collect_complex_layout_children_of(
+                doc,
+                container_node_id,
+                child_id,
+                layout_children,
+                anonymous_block_id,
+                hide_whitespace,
+                needs_wrap,
+            )
         }
         // Push nodes that need wrapping into the current "anonymous block container".
         // If there is not an open one then we create one.
@@ -518,15 +568,6 @@ fn collect_complex_layout_children(
             layout_children.push(child_id);
         }
     });
-
-    // If anonymous block node only contains whitespace then delete it
-    if let Some(anon_id) = *anonymous_block_id {
-        if block_is_only_whitespace(doc, anon_id) {
-            layout_children.pop();
-            doc.nodes.remove(anon_id);
-            *anonymous_block_id = None;
-        }
-    }
 }
 
 fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multiline: bool) {
