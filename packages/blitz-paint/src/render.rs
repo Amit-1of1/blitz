@@ -406,6 +406,10 @@ struct ElementCx<'a> {
     devtools: &'a DevtoolSettings,
 }
 
+/// PATCH(rust-ui): selection highlight, see-through so the selected text stays readable on light
+/// and dark backgrounds.
+const SELECTION_COLOR: Color = Color::from_rgba8(51, 142, 255, 102);
+
 /// Converts parley BoundingBox into peniko Rect
 fn convert_rect(rect: &parley::BoundingBox) -> kurbo::Rect {
     peniko::kurbo::Rect::new(rect.x0, rect.y0, rect.x1, rect.y1)
@@ -421,6 +425,23 @@ impl ElementCx<'_> {
                     panic!("Tried to render node marked as inline root that does not have an inline layout: {:?}", self.node);
                 });
 
+            // PATCH(rust-ui): highlight the selected part of the page text under the glyphs.
+            if let Some(range) = self.context.dom.text_selection_range(self.node.id) {
+                let transform =
+                    self.base * Affine::translate((pos.x * self.scale, pos.y * self.scale));
+                let selection =
+                    blitz_dom::text_selection::layout_selection(&text_layout.layout, range);
+                selection.geometry_with(&text_layout.layout, |rect, _line| {
+                    scene.fill(
+                        Fill::NonZero,
+                        transform,
+                        SELECTION_COLOR,
+                        None,
+                        &convert_rect(&rect),
+                    );
+                });
+            }
+
             // Render text
             crate::text::stroke_text(
                 self.scale,
@@ -433,6 +454,15 @@ impl ElementCx<'_> {
         }
     }
 
+    /// PATCH(rust-ui): the element's text colour (caret and IME underline follow it, so they
+    /// show on dark themes; upstream drew a black caret).
+    fn text_color(&self) -> Color {
+        self.node
+            .primary_styles()
+            .map(|s| blitz_dom::util::ToColorColor::as_color_color(&s.get_inherited_text().color))
+            .unwrap_or(Color::BLACK)
+    }
+
     fn draw_text_input_text(&self, scene: &mut impl PaintScene, pos: Point) {
         // Render the text in text inputs
         if let Some(input_data) = self.text_input {
@@ -440,11 +470,13 @@ impl ElementCx<'_> {
 
             if self.node.is_focussed() {
                 // Render selection/caret
+                // PATCH(rust-ui): a see-through highlight (upstream's opaque steel blue hid the
+                // selected text) and a caret in the text colour.
                 for (rect, _line_idx) in input_data.editor.selection_geometry().iter() {
                     scene.fill(
                         Fill::NonZero,
                         transform,
-                        color::palette::css::STEEL_BLUE,
+                        SELECTION_COLOR,
                         None,
                         &convert_rect(rect),
                     );
@@ -453,11 +485,32 @@ impl ElementCx<'_> {
                     scene.fill(
                         Fill::NonZero,
                         transform,
-                        Color::BLACK,
+                        self.text_color(),
                         None,
                         &convert_rect(&cursor),
                     );
                 };
+            }
+
+            // PATCH(rust-ui): underline the IME preedit text, as platforms do, so it reads as
+            // "not typed yet".
+            if let Some(compose) = input_data.editor.raw_compose().clone() {
+                if let Some(layout) = input_data.editor.try_layout() {
+                    let color = self.text_color();
+                    let thickness = (1.0 * self.scale).max(1.0);
+                    blitz_dom::text_selection::layout_selection(layout, compose).geometry_with(
+                        layout,
+                        |rect, _line| {
+                            let line = kurbo::Rect::new(
+                                rect.x0,
+                                rect.y1 - thickness,
+                                rect.x1,
+                                rect.y1,
+                            );
+                            scene.fill(Fill::NonZero, transform, color, None, &line);
+                        },
+                    );
+                }
             }
 
             // Render text
