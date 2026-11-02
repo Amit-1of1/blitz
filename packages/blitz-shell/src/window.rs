@@ -67,6 +67,10 @@ pub struct View<Rend: WindowRenderer> {
     #[cfg(feature = "accessibility")]
     /// Accessibility adapter for `accesskit`.
     pub accessibility: AccessibilityState,
+
+    /// PATCH(rust-ui): the IME state last told to the platform: the focused field and its
+    /// cursor area, or `None` while no text field has focus.
+    ime_state: Option<(usize, (i32, i32, i32, i32))>,
 }
 
 impl<Rend: WindowRenderer> View<Rend> {
@@ -75,10 +79,22 @@ impl<Rend: WindowRenderer> View<Rend> {
         event_loop: &ActiveEventLoop,
         proxy: &EventLoopProxy<BlitzShellEvent>,
     ) -> Self {
-        let winit_window = Arc::from(event_loop.create_window(config.attributes).unwrap());
+        // PATCH(rust-ui): create the window hidden and show it once the AccessKit adapter exists
+        // (AccessKit requires the adapter before the window is first shown; upstream 0.2 created
+        // it visible, which can panic or leave the window without a tree on Windows).
+        let is_visible = config.attributes.visible;
+        let attributes = config.attributes.with_visible(false);
+        let winit_window = Arc::from(event_loop.create_window(attributes).unwrap());
+        #[cfg(feature = "accessibility")]
+        let accessibility = AccessibilityState::new(&winit_window, proxy.clone());
+        if is_visible {
+            winit_window.set_visible(true);
+        }
 
-        // TODO: make this conditional on text input focus
-        winit_window.set_ime_allowed(true);
+        // PATCH(rust-ui): the IME is turned on only while a text field has focus (see
+        // `sync_ime`); upstream left it on everywhere, so on some platforms keys pressed on a
+        // button went to the IME instead of the page.
+        winit_window.set_ime_allowed(false);
 
         // Create viewport
         let size = winit_window.inner_size();
@@ -115,7 +131,8 @@ impl<Rend: WindowRenderer> View<Rend> {
             mouse_pos: Default::default(),
             is_visible: winit_window.is_visible().unwrap_or(true),
             #[cfg(feature = "accessibility")]
-            accessibility: AccessibilityState::new(&winit_window, proxy.clone()),
+            accessibility,
+            ime_state: None,
         }
     }
 
@@ -195,12 +212,14 @@ impl<Rend: WindowRenderer> View<Rend> {
         if let Some(waker) = &self.waker {
             let cx = std::task::Context::from_waker(waker);
             if self.doc.poll(Some(cx)) {
+                // PATCH(rust-ui): refresh the screen-reader tree whenever polling changed the
+                // document. Upstream asked `has_changes()`, which is inverted and never cleared
+                // in blitz-dom 0.2, so a re-render (a dialog opening, a list filtering) never
+                // reached the screen reader. AccessKit only builds the tree while an assistive
+                // technology is listening.
                 #[cfg(feature = "accessibility")]
-                {
-                    if self.doc.has_changes() {
-                        self.accessibility.update_tree(&self.doc);
-                    }
-                }
+                self.accessibility.update_tree(&self.doc);
+                self.sync_ime();
 
                 self.request_redraw();
                 return true;
@@ -250,7 +269,77 @@ impl<Rend: WindowRenderer> View<Rend> {
         self.accessibility.update_tree(&self.doc);
     }
 
+    /// PATCH(rust-ui): turn the IME on while a text field has focus (off otherwise) and keep
+    /// the platform's candidate window next to the caret or the text being composed.
+    pub fn sync_ime(&mut self) {
+        let state = self.doc.focused_text_input().map(|id| {
+            let area = self
+                .doc
+                .ime_cursor_area()
+                .map(|(x, y, w, h)| (x as i32, y as i32, w.ceil() as i32, h.ceil() as i32))
+                .unwrap_or_default();
+            (id, area)
+        });
+        if state == self.ime_state {
+            return;
+        }
+        match (self.ime_state.is_some(), state) {
+            (_, Some((_, (x, y, w, h)))) => {
+                if self.ime_state.is_none() {
+                    self.window.set_ime_allowed(true);
+                }
+                self.window.set_ime_cursor_area(
+                    winit::dpi::LogicalPosition::new(x, y),
+                    winit::dpi::LogicalSize::new(w.max(1), h.max(1)),
+                );
+            }
+            (true, None) => self.window.set_ime_allowed(false),
+            (false, None) => {}
+        }
+        self.ime_state = state;
+    }
+
+    /// PATCH(rust-ui): carry out what a screen reader (or another assistive technology) asks
+    /// for: move focus, click (press and release on the element, so the app's handlers run as
+    /// for a mouse click), or replace a text field's value (as if typed: `input` fires).
+    /// PATCH(rust-ui): carry out what a screen reader (or another assistive technology) asks
+    /// for (focus, click, set value; see `blitz_dom::perform_accessibility_action`).
+    #[cfg(feature = "accessibility")]
+    pub fn handle_accessibility_action(&mut self, request: accesskit::ActionRequest) {
+        if !blitz_dom::perform_accessibility_action(&mut *self.doc, &request) {
+            return;
+        }
+        self.poll();
+        self.sync_ime();
+        self.accessibility.update_tree(&self.doc);
+        self.request_redraw();
+    }
+
     pub fn handle_winit_event(&mut self, event: WindowEvent) {
+        #[cfg(feature = "accessibility")]
+        self.accessibility.process_window_event(&self.window, &event);
+
+        let after_input = matches!(
+            event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::MouseWheel { .. }
+        );
+        self.handle_winit_event_inner(event);
+        // PATCH(rust-ui): focus, values and positions change on input without the vdom
+        // necessarily changing, so refresh the screen-reader tree and the IME after input
+        // (upstream refreshed the tree only when a re-render changed the document).
+        if after_input {
+            #[cfg(feature = "accessibility")]
+            self.accessibility.update_tree(&self.doc);
+            self.sync_ime();
+        }
+    }
+
+    fn handle_winit_event_inner(&mut self, event: WindowEvent) {
         match event {
             // Window lifecycle events
             WindowEvent::Destroyed => {}

@@ -107,8 +107,9 @@ impl<Rend: WindowRenderer> ApplicationHandler<BlitzShellEvent> for BlitzApplicat
                         accesskit_winit::WindowEvent::AccessibilityDeactivated => {
                             // TODO
                         }
-                        accesskit_winit::WindowEvent::ActionRequested(_req) => {
-                            // TODO
+                        accesskit_winit::WindowEvent::ActionRequested(req) => {
+                            // PATCH(rust-ui): carry out screen-reader actions.
+                            window.handle_accessibility_action(req.clone());
                         }
                     }
                 }
