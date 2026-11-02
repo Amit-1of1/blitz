@@ -464,7 +464,9 @@ impl TextInputData {
         layout_ctx: &mut LayoutContext<TextBrush>,
         text: &str,
     ) {
-        if self.editor.text() != text {
+        // PATCH(rust-ui): a controlled field writes back the value its `input` handler saw,
+        // which includes the IME preedit text; that must not end the composition.
+        if self.editor.raw_text() != text && self.editor.text() != text {
             self.editor.set_text(text);
             self.editor.driver(font_ctx, layout_ctx).refresh_layout();
         }

@@ -18,49 +18,63 @@ pub(crate) fn handle_mousemove(
 ) -> bool {
     let mut changed = doc.set_hover_to(x, y);
 
-    let Some(hit) = doc.hit(x, y) else {
-        return changed;
-    };
-
-    if hit.node_id != target {
-        return changed;
-    }
-
-    let node = &mut doc.nodes[target];
-    let Some(el) = node.data.downcast_element_mut() else {
-        return changed;
-    };
-
-    let disabled = el.attr(local_name!("disabled")).is_some();
-    if disabled {
+    // PATCH(rust-ui): a drag that started in a text field keeps selecting in that field when the
+    // pointer leaves it (upstream stopped as soon as the pointer was over another node), and a
+    // drag that started on page text extends the page selection.
+    if !buttons.contains(MouseEventButtons::Primary) {
+        doc.text_input_drag = None;
+        doc.end_text_selection_drag();
         return changed;
     }
-
-    if let SpecialElementData::TextInput(ref mut text_input_data) = el.special_data {
-        if buttons == MouseEventButtons::None {
-            return changed;
-        }
-
-        let content_box_offset = taffy::Point {
-            x: node.final_layout.padding.left + node.final_layout.border.left,
-            y: node.final_layout.padding.top + node.final_layout.border.top,
-        };
-
-        let x = (hit.x - content_box_offset.x) as f64 * doc.viewport.scale_f64();
-        let y = (hit.y - content_box_offset.y) as f64 * doc.viewport.scale_f64();
-
-        text_input_data
-            .editor
-            .driver(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx)
-            .extend_selection_to_point(x as f32, y as f32);
-
+    if let Some(field) = doc.text_input_drag {
+        return extend_field_selection(doc, field, x, y) || changed;
+    }
+    if doc.extend_text_selection(x, y) {
         changed = true;
     }
-
+    let _ = target;
     changed
 }
 
-pub(crate) fn handle_mousedown(doc: &mut BaseDocument, target: usize, x: f32, y: f32) {
+/// Field-local, layout-scaled coordinates of the document point `(x, y)`.
+fn field_coords(doc: &BaseDocument, field: usize, x: f32, y: f32) -> (f32, f32) {
+    let node = &doc.nodes[field];
+    let origin = node.absolute_position(0.0, 0.0);
+    let l = &node.final_layout;
+    let scale = doc.viewport.scale_f64();
+    (
+        ((x - origin.x - l.padding.left - l.border.left) as f64 * scale) as f32,
+        ((y - origin.y - l.padding.top - l.border.top) as f64 * scale) as f32,
+    )
+}
+
+fn extend_field_selection(doc: &mut BaseDocument, field: usize, x: f32, y: f32) -> bool {
+    let (fx, fy) = field_coords(doc, field, x, y);
+    let node = &mut doc.nodes[field];
+    let Some(input) = node
+        .data
+        .downcast_element_mut()
+        .and_then(|el| el.text_input_data_mut())
+    else {
+        doc.text_input_drag = None;
+        return false;
+    };
+    if input.editor.is_composing() {
+        return false;
+    }
+    input
+        .editor
+        .driver(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx)
+        .extend_selection_to_point(fx, fy);
+    true
+}
+
+pub(crate) fn handle_mousedown(
+    doc: &mut BaseDocument,
+    target: usize,
+    event: &BlitzMouseButtonEvent,
+) {
+    let (x, y) = (event.x, event.y);
     // PATCH(rust-ui): a click focuses the nearest focusable ancestor (or blurs when there is
     // none), as browsers do; upstream only focused text inputs.
     match doc.focus_target_for_click(target) {
@@ -70,38 +84,62 @@ pub(crate) fn handle_mousedown(doc: &mut BaseDocument, target: usize, x: f32, y:
         None => doc.clear_focus(),
     }
 
-    let Some(hit) = doc.hit(x, y) else {
-        return;
-    };
-    if hit.node_id != target {
+    if event.button != MouseEventButton::Main {
         return;
     }
+    // PATCH(rust-ui): count presses close in time and place, for double and triple click.
+    let clicks = doc.count_press(x, y);
+    let shift = event.mods.contains(keyboard_types::Modifiers::SHIFT);
 
-    let node = &mut doc.nodes[target];
+    let field = doc.nodes[target]
+        .element_data()
+        .is_some_and(|el| el.text_input_data().is_some())
+        .then_some(target);
+    let Some(field) = field else {
+        // Page text: start (or clear) a selection.
+        doc.text_input_drag = None;
+        doc.start_text_selection(target, x, y, clicks, shift);
+        return;
+    };
+
+    let node = &mut doc.nodes[field];
     let Some(el) = node.data.downcast_element_mut() else {
         return;
     };
-
-    let disabled = el.attr(local_name!("disabled")).is_some();
-    if disabled {
+    if el.attr(local_name!("disabled")).is_some() {
         return;
     }
+    doc.clear_text_selection();
 
-    if let SpecialElementData::TextInput(ref mut text_input_data) = el.special_data {
-        let content_box_offset = taffy::Point {
-            x: node.final_layout.padding.left + node.final_layout.border.left,
-            y: node.final_layout.padding.top + node.final_layout.border.top,
-        };
-        let x = (hit.x - content_box_offset.x) as f64 * doc.viewport.scale_f64();
-        let y = (hit.y - content_box_offset.y) as f64 * doc.viewport.scale_f64();
-
-        text_input_data
+    let (fx, fy) = field_coords(doc, field, x, y);
+    let node = &mut doc.nodes[field];
+    let Some(input) = node
+        .data
+        .downcast_element_mut()
+        .and_then(|el| el.text_input_data_mut())
+    else {
+        return;
+    };
+    if input.editor.is_composing() {
+        // A press while composing commits the composition, as browsers do.
+        input
             .editor
             .driver(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx)
-            .move_to_point(x as f32, y as f32);
-
-        doc.set_focus_to(hit.node_id);
+            .finish_compose();
     }
+    let mut font_ctx = doc.font_ctx.lock().unwrap();
+    let mut driver = input.editor.driver(&mut font_ctx, &mut doc.layout_ctx);
+    // PATCH(rust-ui): Shift+click extends, a double click selects a word and a triple click
+    // the line, as in browsers; upstream only placed the caret.
+    match (shift, clicks) {
+        (true, _) => driver.shift_click_extension(fx, fy),
+        (false, 2) => driver.select_word_at_point(fx, fy),
+        (false, n) if n >= 3 => driver.select_hard_line_at_point(fx, fy),
+        _ => driver.move_to_point(fx, fy),
+    }
+    drop(font_ctx);
+    doc.text_input_drag = Some(field);
+    doc.set_focus_to(field);
 }
 
 pub(crate) fn handle_mouseup<F: FnMut(DomEvent)>(
@@ -110,6 +148,12 @@ pub(crate) fn handle_mouseup<F: FnMut(DomEvent)>(
     event: &BlitzMouseButtonEvent,
     mut dispatch_event: F,
 ) {
+    // PATCH(rust-ui): the drag that selects text ends with the button.
+    if event.button == MouseEventButton::Main {
+        doc.text_input_drag = None;
+        doc.end_text_selection_drag();
+    }
+
     if doc.devtools().highlight_hover {
         let mut node = doc.get_node(target).unwrap();
         if event.button == MouseEventButton::Secondary {

@@ -33,7 +33,7 @@ pub(crate) fn handle_dom_event<F: FnMut(DomEvent)>(
             }
         }
         DomEventData::MouseDown(event) => {
-            handle_mousedown(doc, target_node_id, event.x, event.y);
+            handle_mousedown(doc, target_node_id, event);
         }
         DomEventData::MouseUp(event) => {
             handle_mouseup(doc, target_node_id, event, dispatch_event);

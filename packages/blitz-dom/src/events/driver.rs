@@ -98,6 +98,8 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
             UiEvent::Ime(data) => DomEventData::Ime(data),
         };
 
+        // PATCH(rust-ui): an embedder may aim the event at a node (an accessibility action).
+        let target = self.doc_mut().next_event_target.take().or(target);
         let target = target.unwrap_or_else(|| self.doc().root_element().id);
         let dom_event = DomEvent::new(target, data);
 

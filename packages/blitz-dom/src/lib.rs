@@ -52,6 +52,8 @@ mod mutator;
 mod query_selector;
 /// Implementations that interact with servo's style engine
 mod stylo;
+/// PATCH(rust-ui): selecting and copying page text.
+pub mod text_selection;
 mod stylo_to_cursor_icon;
 mod stylo_to_parley;
 mod traversal;
@@ -62,6 +64,8 @@ pub mod util;
 
 #[cfg(feature = "accessibility")]
 mod accessibility;
+#[cfg(feature = "accessibility")]
+pub use accessibility::{WINDOW_NODE_ID, perform_accessibility_action};
 
 pub use config::DocumentConfig;
 pub use document::{BaseDocument, Document};

@@ -24,6 +24,40 @@ pub(crate) fn handle_keypress<F: FnMut(DomEvent)>(
 ) {
     // PATCH(rust-ui): Shift+Tab moves backwards, Tab with nothing focused starts at the first
     // focusable element, and Enter/Space activate buttons and links like a click.
+    // PATCH(rust-ui): keys pressed while an IME composes in the focused field are the IME's.
+    let composing = doc.focus_node_id.is_some_and(|id| {
+        doc.nodes[id]
+            .element_data()
+            .and_then(|el| el.text_input_data())
+            .is_some_and(|input| input.editor.is_composing())
+    });
+    if composing {
+        return;
+    }
+
+    // PATCH(rust-ui): Ctrl+C (Cmd+C) copies a selection of page text when no text field has
+    // focus (a focused field copies its own selection below).
+    if event.state.is_pressed() && event.modifiers.contains(ACTION_MOD) {
+        let field_focused = doc.focus_node_id.is_some_and(|id| {
+            doc.nodes[id]
+                .element_data()
+                .is_some_and(|el| el.text_input_data().is_some())
+        });
+        if !field_focused {
+            if let Key::Character(c) = &event.key {
+                if c.eq_ignore_ascii_case("c") {
+                    if let Some(text) = doc.selected_text() {
+                        let _ = doc.shell_provider.set_clipboard_text(text);
+                    }
+                    return;
+                }
+                if c.eq_ignore_ascii_case("a") && doc.select_all_text() {
+                    return;
+                }
+            }
+        }
+    }
+
     if event.key == Key::Tab {
         if event.modifiers.contains(Modifiers::SHIFT) {
             doc.focus_prev_node();
@@ -116,6 +150,12 @@ fn apply_keypress_event(
     let mods = event.modifiers;
     let shift = mods.contains(Modifiers::SHIFT);
     let action_mod = mods.contains(ACTION_MOD);
+
+    // PATCH(rust-ui): while an IME composes, keys belong to the IME (browsers report them with
+    // `isComposing` and do not edit the field); editing here would desync the preedit range.
+    if input_data.editor.is_composing() {
+        return None;
+    }
 
     let is_multiline = input_data.is_multiline;
     let editor = &mut input_data.editor;

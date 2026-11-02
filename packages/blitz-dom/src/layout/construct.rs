@@ -583,7 +583,9 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multil
         let mut text_input_data = TextInputData::new(is_multiline);
         let editor = &mut text_input_data.editor;
 
-        editor.set_text(element.attr(local_name!("value")).unwrap_or(" "));
+        // PATCH(rust-ui): a field without a value starts empty (upstream put a space in it, so
+        // text typed into an uncontrolled field began with " ").
+        editor.set_text(element.attr(local_name!("value")).unwrap_or(""));
         editor.set_scale(doc.viewport.scale_f64() as f32);
         editor.set_width(None);
 

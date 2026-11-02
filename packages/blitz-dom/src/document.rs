@@ -147,6 +147,17 @@ pub struct BaseDocument {
     pub(crate) active_node_id: Option<usize>,
     /// The node which recieved a mousedown event (if any)
     pub(crate) mousedown_node_id: Option<usize>,
+    /// PATCH(rust-ui): the page-text selection (see `text_selection.rs`).
+    pub(crate) text_selection: Option<crate::text_selection::TextSelection>,
+    /// PATCH(rust-ui): whether the main button is down after starting a page-text selection.
+    pub(crate) text_selecting: bool,
+    /// PATCH(rust-ui): the text field a selecting drag started in.
+    pub(crate) text_input_drag: Option<usize>,
+    /// PATCH(rust-ui): time, place and count of the last presses, for double and triple click.
+    last_press: Option<(std::time::Instant, f32, f32, u32)>,
+    /// PATCH(rust-ui): the node the next UI event goes to, whatever is under the pointer (used to
+    /// carry out a screen reader's "click" on an element).
+    pub(crate) next_event_target: Option<usize>,
 
     /// Whether there are active CSS animations/transitions (so we should re-render every frame)
     pub(crate) has_active_animations: bool,
@@ -286,6 +297,11 @@ impl BaseDocument {
             failed_images: Vec::new(),
             active_node_id: None,
             mousedown_node_id: None,
+            text_selection: None,
+            text_selecting: false,
+            text_input_drag: None,
+            last_press: None,
+            next_event_target: None,
             has_active_animations: false,
             has_canvas: false,
             changed_nodes: HashSet::new(),
@@ -997,9 +1013,27 @@ impl BaseDocument {
         None
     }
 
+    /// PATCH(rust-ui): a field that loses focus keeps the text being composed, as in browsers.
+    fn finish_composition(&mut self, node_id: usize) {
+        let Some(input) = self.nodes[node_id]
+            .data
+            .downcast_element_mut()
+            .and_then(|el| el.text_input_data_mut())
+        else {
+            return;
+        };
+        if input.editor.is_composing() {
+            input
+                .editor
+                .driver(&mut self.font_ctx.lock().unwrap(), &mut self.layout_ctx)
+                .finish_compose();
+        }
+    }
+
     /// Clear the focussed node
     pub fn clear_focus(&mut self) {
         if let Some(id) = self.focus_node_id {
+            self.finish_composition(id);
             self.snapshot_node_and(id, |node| node.blur());
             self.focus_node_id = None;
         }
@@ -1007,6 +1041,88 @@ impl BaseDocument {
 
     pub fn set_mousedown_node_id(&mut self, node_id: Option<usize>) {
         self.mousedown_node_id = node_id;
+    }
+
+    /// PATCH(rust-ui): the number of presses in a row at about this place (1 for a single
+    /// click, 2 for a double click...). Presses count together when they are under 500 ms and
+    /// 4 px apart, like the usual desktop settings.
+    pub(crate) fn count_press(&mut self, x: f32, y: f32) -> u32 {
+        let now = std::time::Instant::now();
+        let count = match self.last_press {
+            Some((t, px, py, n))
+                if now.duration_since(t).as_millis() < 500
+                    && (px - x).abs() <= 4.0
+                    && (py - y).abs() <= 4.0 =>
+            {
+                n + 1
+            }
+            _ => 1,
+        };
+        self.last_press = Some((now, x, y, count));
+        count
+    }
+
+    /// PATCH(rust-ui): send the next UI event to `node_id` instead of the node under the
+    /// pointer. An embedder carrying out an accessibility "click" uses this, so the press goes
+    /// to the element the screen reader named even when something covers it.
+    pub fn set_next_event_target(&mut self, node_id: Option<usize>) {
+        self.next_event_target = node_id;
+    }
+
+    /// PATCH(rust-ui): select all the text of a text field (an assistive technology's "set
+    /// value" replaces the selection). Returns whether `node_id` is an editable field.
+    pub fn select_all_in_text_input(&mut self, node_id: usize) -> bool {
+        let Some(input) = self
+            .nodes
+            .get_mut(node_id)
+            .and_then(|n| n.data.downcast_element_mut())
+            .and_then(|el| el.text_input_data_mut())
+        else {
+            return false;
+        };
+        let mut font_ctx = self.font_ctx.lock().unwrap();
+        let mut driver = input.editor.driver(&mut font_ctx, &mut self.layout_ctx);
+        driver.finish_compose();
+        driver.select_all();
+        true
+    }
+
+    /// PATCH(rust-ui): whether the focused element takes text, so the embedder can turn the
+    /// platform IME on only while typing is possible.
+    pub fn focused_text_input(&self) -> Option<usize> {
+        let id = self.focus_node_id?;
+        let el = self.nodes.get(id)?.element_data()?;
+        let editable = el.text_input_data().is_some()
+            && el.attr(local_name!("readonly")).is_none()
+            && el.attr(local_name!("disabled")).is_none();
+        editable.then_some(id)
+    }
+
+    /// PATCH(rust-ui): the area of the focused field the IME should keep clear (the preedit
+    /// text, or else the caret), as `(x, y, width, height)` in window coordinates (logical
+    /// pixels, after scrolling). The embedder passes it to the platform so the candidate window
+    /// opens next to the text being typed.
+    pub fn ime_cursor_area(&self) -> Option<(f32, f32, f32, f32)> {
+        let id = self.focused_text_input()?;
+        let node = &self.nodes[id];
+        let input = node.element_data()?.text_input_data()?;
+        let area = input.editor.ime_cursor_area();
+        let scale = self.viewport.scale_f64();
+        let origin = node.absolute_position(0.0, 0.0);
+        let l = &node.final_layout;
+        let zoom = self.viewport.zoom();
+        let x = (origin.x + l.padding.left + l.border.left) as f64 + area.x0 / scale
+            - self.viewport_scroll.x;
+        let y = (origin.y + l.padding.top + l.border.top) as f64 + area.y0 / scale
+            - self.viewport_scroll.y;
+        let w = (area.x1 - area.x0) / scale;
+        let h = (area.y1 - area.y0) / scale;
+        Some((
+            x as f32 * zoom,
+            y as f32 * zoom,
+            (w as f32).max(1.0) * zoom,
+            h as f32 * zoom,
+        ))
     }
     pub fn set_focus_to(&mut self, focus_node_id: usize) -> bool {
         if Some(focus_node_id) == self.focus_node_id {
@@ -1018,6 +1134,7 @@ impl BaseDocument {
 
         // Remove focus from the old node
         if let Some(id) = self.focus_node_id {
+            self.finish_composition(id);
             self.snapshot_node_and(id, |node| node.blur());
         }
 
